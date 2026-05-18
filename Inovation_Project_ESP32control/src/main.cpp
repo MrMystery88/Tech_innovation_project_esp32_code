@@ -1,45 +1,71 @@
-#include <Arduino.h>         // Main Arduino library
-#include <WiFi.h>              // WiFi functionality for ESP32
-#include <AsyncTCP.h>          // Required for async web server
-#include <ESPAsyncWebServer.h> // Web server + WebSocket library
-#include <math.h>              // Used for sin() and cos()
+#include <Arduino.h>
+#include <Wire.h>
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <ESP32Servo.h>
+#include <MPU6050.h>
+#include <math.h>
 
-// =========================
 // WIFI SETTINGS
-// =========================
+const char* ssid = "AndroidAP"; //chanege to your wifi ssid
+const char* password = "MONEY2107"; //change to your wifi password
 
-// Your WiFi network name
-const char* ssid = "AndroidAP"; //change this to your network name
-
-// Your WiFi password
-const char* password = "MONEY2107"; // change this to your network password
-
-// =========================
-// CREATE SERVER OBJECTS
-// =========================
-
-// Creates a web server on port 80
-// Port 80 is standard HTTP
+// WEB SERVER
 AsyncWebServer server(80);
-
-// Creates a WebSocket endpoint
-// Laptop connects to:
-// ws://IP_ADDRESS/ws
 AsyncWebSocket ws("/ws");
 
-// =========================
-// FAKE GYRO VARIABLES
-// =========================
+// MPU6050
+MPU6050 mpu;
 
-// Used to animate fake gyro values
-float t = 0;
+// SERVOS
+Servo servoRoll;
+Servo servoPitch;
 
-// =========================
-// HTML WEBPAGE
-// =========================
+#define ROLL_SERVO_PIN 18
+#define PITCH_SERVO_PIN 19
 
-// PROGMEM stores the webpage in flash memory
-// instead of using precious RAM
+
+// PID VARIABLES
+
+// Target angles
+float targetRoll = 0;
+float targetPitch = 0;
+
+bool calibrated = false;
+
+// Current angles
+float roll = 0;
+float pitch = 0;
+
+// PID errors
+float rollError;
+float pitchError;
+
+float previousRollError = 0;
+float previousPitchError = 0;
+
+float rollIntegral = 0;
+float pitchIntegral = 0;
+
+// =====================================================
+// PID TUNING
+// =====================================================
+
+float Kp = 3.5;
+float Ki = 0.02;
+float Kd = 1.2;
+
+// SERVO POSITIONS
+
+int rollServoPos = 90;
+int pitchServoPos = 90;
+
+
+// TIMING
+unsigned long previousTime = 0;
+
+// HTML PAGE
 const char index_html[] PROGMEM = R"rawliteral(
 
 <!DOCTYPE html>
@@ -47,33 +73,30 @@ const char index_html[] PROGMEM = R"rawliteral(
 
 <head>
 
-  <title>ESP32 Gyro Test</title>
+  <title>ESP32 Self Leveling Spoon</title>
 
   <style>
 
-    /* Page background + default text */
     body {
       background: #111;
       color: white;
       font-family: Arial;
       text-align: center;
-      margin-top: 50px;
+      margin-top: 40px;
     }
 
-    /* Main heading */
     h1 {
       font-size: 3em;
+      color: #00ff88;
     }
 
-    /* Style for sensor value sections */
     .data {
       font-size: 2em;
       margin: 20px;
     }
 
-    /* Green numbers */
     .value {
-      color: #00ff88;
+      color: #00ccff;
     }
 
   </style>
@@ -82,73 +105,70 @@ const char index_html[] PROGMEM = R"rawliteral(
 
 <body>
 
-<!-- Page title -->
-<h1>ESP32 Fake Gyroscope</h1>
+<h1>ESP32 Spoon Stabilizer</h1>
 
-<!-- X axis value -->
 <div class="data">
-  X: <span class="value" id="gx">0</span>
+  Roll:
+  <span class="value" id="roll">0</span>
 </div>
 
-<!-- Y axis value -->
 <div class="data">
-  Y: <span class="value" id="gy">0</span>
+  Pitch:
+  <span class="value" id="pitch">0</span>
 </div>
 
-<!-- Z axis value -->
 <div class="data">
-  Z: <span class="value" id="gz">0</span>
+  Roll Servo:
+  <span class="value" id="servoR">0</span>
+</div>
+
+<div class="data">
+  Pitch Servo:
+  <span class="value" id="servoP">0</span>
 </div>
 
 <script>
 
-// =========================
-// JAVASCRIPT SECTION
-// =========================
-
-// Creates websocket address automatically
-// Example:
-// ws://192.168.1.45/ws
 let gateway = `ws://${window.location.hostname}/ws`;
 
 let websocket;
 
-// When webpage fully loads
 window.addEventListener('load', onLoad);
 
-// Runs once page loads
 function onLoad() {
   initWebSocket();
 }
 
-// Connect to ESP32 websocket
 function initWebSocket() {
 
   websocket = new WebSocket(gateway);
 
-  // Runs when connected
   websocket.onopen = () => {
     console.log("WebSocket Connected");
   };
 
-  // Runs if disconnected
   websocket.onclose = () => {
+
     console.log("WebSocket Disconnected");
 
-    // Try reconnecting after 2 seconds
     setTimeout(initWebSocket, 2000);
   };
 
-  // Runs every time ESP32 sends data
   websocket.onmessage = (event) => {
 
-    // Convert JSON text into usable data
     let data = JSON.parse(event.data);
 
-    // Update webpage numbers
-    document.getElementById("gx").innerHTML = data.x.toFixed(2);
-    document.getElementById("gy").innerHTML = data.y.toFixed(2); 
-    document.getElementById("gz").innerHTML = data.z.toFixed(2);
+    document.getElementById("roll").innerHTML =
+      data.roll.toFixed(2);
+
+    document.getElementById("pitch").innerHTML =
+      data.pitch.toFixed(2);
+
+    document.getElementById("servoR").innerHTML =
+      data.servoR;
+
+    document.getElementById("servoP").innerHTML =
+      data.servoP;
   };
 }
 
@@ -159,11 +179,10 @@ function initWebSocket() {
 
 )rawliteral";
 
-// =========================
-// WEBSOCKET EVENT FUNCTION
-// =========================
+// =====================================================
+// WEBSOCKET EVENT
+// =====================================================
 
-// This runs when websocket events occur
 void onEvent(AsyncWebSocket *server,
              AsyncWebSocketClient *client,
              AwsEventType type,
@@ -171,32 +190,108 @@ void onEvent(AsyncWebSocket *server,
              uint8_t *data,
              size_t len) {
 
-  // Detect new connection
   if(type == WS_EVT_CONNECT) {
 
     Serial.println("Client Connected");
   }
 }
 
-// =========================
-// SETUP FUNCTION
-// =========================
 
 void setup() {
 
-  // Start serial monitor
   Serial.begin(9600);
 
-  // =========================
-  // CONNECT TO WIFI
-  // =========================
+  // I2C
+  Wire.begin();
+
+  // MPU6050 SETUP
+  mpu.initialize();
+
+  if (!mpu.testConnection()) {
+
+    Serial.println("MPU6050 FAILED");
+
+    while (1);
+  }
+
+  Serial.println("MPU6050 Connected");
+
+  // SERVO SETUP
+  servoRoll.attach(ROLL_SERVO_PIN);
+  servoPitch.attach(PITCH_SERVO_PIN);
+
+  // Center servos initially
+  servoRoll.write(90);
+  servoPitch.write(90);
+
+  delay(1000);
+
+  // AUTO CALIBRATION
+  // PLACE SPOON FLAT DURING STARTUP
+
+  Serial.println("");
+  Serial.println("=================================");
+  Serial.println("CALIBRATING...");
+  Serial.println("KEEP SPOON FLAT AND STILL");
+  Serial.println("=================================");
+
+  float rollSum = 0;
+  float pitchSum = 0;
+
+  for(int i = 0; i < 200; i++) {
+
+    int16_t ax, ay, az;
+    int16_t gx, gy, gz;
+
+    mpu.getMotion6(&ax, &ay, &az,
+                   &gx, &gy, &gz);
+
+    // Calculate accelerometer angles
+    float accelRoll =
+      atan2(ay, az) * 180 / PI;
+
+    float accelPitch =
+      atan2(-ax,
+      sqrt(ay * ay + az * az))
+      * 180 / PI;
+
+    // Add to totals
+    rollSum += accelRoll;
+    pitchSum += accelPitch;
+
+    delay(5);
+  }
+
+  // SET TARGET LEVEL POSITION
+  targetRoll = rollSum / 200.0;
+  targetPitch = pitchSum / 200.0;
+
+  // RESET FILTER TO TARGET
+  // PREVENTS STARTUP JUMP
+  roll = targetRoll;
+  pitch = targetPitch;
+
+  calibrated = true;
+
+  Serial.println("");
+  Serial.println("Calibration Complete");
+
+  Serial.print("Target Roll: ");
+  Serial.println(targetRoll);
+
+  Serial.print("Target Pitch: ");
+  Serial.println(targetPitch);
+
+  // =====================================================
+  // WIFI CONNECTION
+  // =====================================================
 
   WiFi.begin(ssid, password);
 
-  Serial.print("Connecting");
+  Serial.println("");
+  Serial.print("Connecting To WiFi");
 
-  // Wait until connected
-  while(WiFi.status() != WL_CONNECTED) {
+  while (WiFi.status() != WL_CONNECTED) {
 
     delay(500);
     Serial.print(".");
@@ -205,96 +300,169 @@ void setup() {
   Serial.println("");
   Serial.println("WiFi Connected");
 
-  // Print ESP32 IP address
+  // Print IP address
   Serial.print("ESP32 IP Address: ");
   Serial.println(WiFi.localIP());
 
-  // =========================
   // WEBSOCKET SETUP
-  // =========================
-
-  // Attach websocket event function
   ws.onEvent(onEvent);
 
-  // Add websocket handler to server
   server.addHandler(&ws);
 
-  // =========================
+
   // WEBPAGE ROUTE
-  // =========================
+  server.on("/", HTTP_GET,
+    [](AsyncWebServerRequest *request) {
 
-  // When user opens:
-  // http://ESP_IP_ADDRESS
-  // send webpage
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+      request->send_P(200,
+                      "text/html",
+                      index_html);
+    });
 
-    request->send_P(200, "text/html", index_html);
-  });
 
-  // Start web server
+  // START SERVER
   server.begin();
 
-  Serial.println("Server Started");
-}
+  Serial.println("Web Server Started");
 
-// =========================
-// MAIN LOOP
-// =========================
+
+  // START TIMER
+
+  previousTime = micros();
+
+  Serial.println("");
+  Serial.println("=================================");
+  Serial.println("SELF LEVELING ACTIVE");
+  Serial.println("=================================");
+}
 
 void loop() {
 
-  // =========================
-  // GENERATE FAKE GYRO DATA
-  // =========================
+  // DELTA TIME
+  unsigned long currentTime = micros();
 
-  // Creates smooth wave motion
-  float gx = sin(t) * 100;
+  float dt =
+    (currentTime - previousTime) / 1000000.0;
 
-  // Cosine wave for Y
-  float gy = cos(t) * 100;
+  previousTime = currentTime;
 
-  // Slower sine wave for Z
-  float gz = sin(t * 0.5) * 50;
+  // READ MPU6050
+  int16_t ax, ay, az;
+  int16_t gx, gy, gz;
 
-  // Increase time variable
-  t += 0.1;
+  mpu.getMotion6(&ax, &ay, &az,&gx, &gy, &gz);
 
-  // =========================
-  // CREATE JSON DATA
-  // =========================
+  // =====================================================
+  // ACCEL ANGLES
+  // =====================================================
 
-  // Create JSON string manually
+  float accelRoll =
+    atan2(ay, az) * 180 / PI;
+
+  float accelPitch =
+    atan2(-ax,
+    sqrt(ay * ay + az * az))
+    * 180 / PI;
+
+  // =====================================================
+  // GYRO RATES
+  // =====================================================
+
+  float gyroRollRate = gx / 131.0;
+  float gyroPitchRate = gy / 131.0;
+
+  // COMPLEMENTARY FILTER
+  roll =
+    0.98 * (roll + gyroRollRate * dt) +
+    0.02 * accelRoll;
+
+  pitch =
+    0.98 * (pitch + gyroPitchRate * dt) +
+    0.02 * accelPitch;
+
+  // =====================================================
+  // PID ROLL
+  // =====================================================
+
+  rollError = targetRoll - roll;
+
+  rollIntegral += rollError * dt;
+
+  float rollDerivative =
+    (rollError - previousRollError) / dt;
+
+  float rollOutput =
+    (Kp * rollError) +
+    (Ki * rollIntegral) +
+    (Kd * rollDerivative);
+
+  previousRollError = rollError;
+
+  // =====================================================
+  // PID PITCH
+  // =====================================================
+
+  pitchError = targetPitch - pitch;
+
+  pitchIntegral += pitchError * dt;
+
+  float pitchDerivative =
+    (pitchError - previousPitchError) / dt;
+
+  float pitchOutput =
+    (Kp * pitchError) +
+    (Ki * pitchIntegral) +
+    (Kd * pitchDerivative);
+
+  previousPitchError = pitchError;
+
+  // =====================================================
+  // SERVO OUTPUT
+  // =====================================================
+
+  rollServoPos = 90 + rollOutput;
+  pitchServoPos = 90 + pitchOutput;
+
+  rollServoPos =
+    constrain(rollServoPos, 0, 180);
+
+  pitchServoPos =
+    constrain(pitchServoPos, 0, 180);
+
+  servoRoll.write(rollServoPos);
+  servoPitch.write(pitchServoPos);
+
+  // =====================================================
+  // CREATE JSON
+  // =====================================================
+
   String json = "{";
 
-  json += "\"x\":" + String(gx) + ",";
-  json += "\"y\":" + String(gy) + ",";
-  json += "\"z\":" + String(gz);
+  json += "\"roll\":" + String(roll) + ",";
+  json += "\"pitch\":" + String(pitch) + ",";
+  json += "\"servoR\":" + String(rollServoPos) + ",";
+  json += "\"servoP\":" + String(pitchServoPos);
 
   json += "}";
 
-  // Example result:
-  // {
-  //   "x":52.3,
-  //   "y":18.2,
-  //   "z":7.1
-  // }
-
-  // =========================
-  // SEND DATA TO LAPTOP
-  // =========================
-
-  // Send JSON to all connected webpages
+  // SEND TO WEBPAGE
   ws.textAll(json);
 
-  // =========================
-  // UPDATE SPEED
-  // =========================
 
-  // Delay controls refresh speed
+  // SERIAL DEBUG
+  Serial.print("Roll: ");
+  Serial.print(roll);
 
-  // 50ms = 20 updates/sec
-  // 20ms = 50 updates/sec
-  // 10ms = 100 updates/sec
+  Serial.print("  Pitch: ");
+  Serial.print(pitch);
 
-  delay(20);
+  Serial.print("  ServoR: ");
+  Serial.print(rollServoPos);
+
+  Serial.print("  ServoP: ");
+  Serial.println(pitchServoPos);
+
+  // FAST LOOP
+
+  delay(5);
 }
